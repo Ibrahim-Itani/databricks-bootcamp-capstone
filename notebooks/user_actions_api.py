@@ -1,318 +1,90 @@
-"""
-Open-Meteo weather engine backing the weather-mcp-server.
+# Databricks notebook source
+# DBTITLE 1,User Actions API
+# MAGIC %md
+# MAGIC # User Actions API
+# MAGIC
+# MAGIC Provides write/action functions to persist user interactions to Lakebase:
+# MAGIC * **Favorite Locations** - Save and manage preferred destinations
+# MAGIC * **Trips** - Log and track travel plans
+# MAGIC * **Notes** - Store location and trip-related notes
+# MAGIC * **Alerts** - Set up weather and custom notifications
+# MAGIC
+# MAGIC ## Prerequisites
+# MAGIC
+# MAGIC 1. Run `sql/03_setup_user_actions_table.sql` to create the user actions tables
+# MAGIC 2. Ensure Lakebase connection is configured in secrets
+# MAGIC 3. Current user ID is derived from Databricks workspace context
 
-Functionality:
-1- Current conditions - get_current_weather(location) - temperature, conditions, humidity, wind
-2- Forecast - get_forecast(location, days) - multi-day forecast with temp high/low, precipitation
-3- Travel recommendation - get_travel_recommendation(location, date) - weather-based travel advice
-"""
+# COMMAND ----------
 
+# DBTITLE 1,Install packages
+# MAGIC %pip install -q 'databricks-sdk>=0.118.0' psycopg2-binary
+
+# COMMAND ----------
+
+# DBTITLE 1,Restart kernel
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# DBTITLE 1,Lakebase connection setup
 import base64
-import os
-import logging
 import json
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List
-import requests
-
+from urllib.parse import urlparse
 from databricks.sdk import WorkspaceClient
+from typing import Optional, Dict, Any, List
+import psycopg2
 from psycopg2.extras import RealDictCursor
+from datetime import datetime, date
+import uuid
 
-import lakebase
+w = WorkspaceClient()
 
-logger = logging.getLogger(__name__)
-_w = WorkspaceClient()
+def get_lakebase_url() -> str:
+    secret = w.secrets.get_secret(scope="database", key="lakebase-url")
+    return base64.b64decode(secret.value).decode("utf-8")
 
-# Open-Meteo API endpoints (free, no API key required)
-GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+lakebase_url = get_lakebase_url()
+parsed = urlparse(lakebase_url)
 
-def _geocode_location(location: str) -> Dict[str, float]:
-    """
-    Convert a location name (e.g., 'San Francisco, CA') to latitude/longitude.
-    
-    Args:
-        location: City name, optionally with state/country
-    
-    Returns:
-        Dict with 'latitude', 'longitude', and 'name'
-    
-    Raises:
-        ValueError: If location cannot be geocoded
-    """
-    try:
-        response = requests.get(
-            GEOCODING_URL,
-            params={"name": location, "count": 1, "language": "en", "format": "json"},
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data.get("results"):
-            raise ValueError(f"Location '{location}' not found")
-        
-        result = data["results"][0]
-        return {
-            "latitude": result["latitude"],
-            "longitude": result["longitude"],
-            "name": result["name"]
-        }
-    except Exception as e:
-        logger.error(f"Geocoding failed for '{location}': {e}")
-        raise ValueError(f"Could not geocode location '{location}': {str(e)}")
+db_host = parsed.hostname
+db_port = parsed.port or 5432
+db_name = parsed.path.lstrip('/')
+db_user = parsed.username
+db_password = parsed.password
 
-def get_current_weather(location: str) -> Dict[str, Any]:
-    """
-    Get current weather conditions for a location.
-    
-    Args:
-        location: City name and state (e.g., 'San Francisco, CA')
-    
-    Returns:
-        Dict with temperature, conditions, humidity, and wind speed
-    """
-    try:
-        # Geocode the location
-        coords = _geocode_location(location)
-        
-        # Fetch current weather from Open-Meteo
-        response = requests.get(
-            WEATHER_URL,
-            params={
-                "latitude": coords["latitude"],
-                "longitude": coords["longitude"],
-                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
-                "temperature_unit": "fahrenheit",
-                "wind_speed_unit": "mph"
-            },
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        current = data.get("current", {})
-        
-        # Map weather codes to conditions
-        weather_code = current.get("weather_code", 0)
-        conditions = _weather_code_to_description(weather_code)
-        
-        return {
-            "location": coords["name"],
-            "temperature_f": current.get("temperature_2m"),
-            "conditions": conditions,
-            "humidity_percent": current.get("relative_humidity_2m"),
-            "wind_speed_mph": current.get("wind_speed_10m"),
-            "timestamp": current.get("time")
-        }
-    except Exception as e:
-        logger.error(f"Failed to get current weather for '{location}': {e}")
-        return {"error": str(e)}
+# Get current user ID from workspace
+current_user = w.current_user.me()
+USER_ID = current_user.user_name
 
-def get_forecast(location: str, days: float) -> Dict[str, Any]:
-    """
-    Get multi-day weather forecast.
-    
-    Args:
-        location: City name and state (e.g., 'Boston, MA')
-        days: Number of days to forecast (max 16)
-    
-    Returns:
-        Dict with daily forecasts including temp high/low, precipitation, conditions
-    """
-    try:
-        # Geocode the location
-        coords = _geocode_location(location)
-        
-        # Ensure days is within valid range
-        days = max(1, min(int(days), 16))
-        
-        # Fetch forecast from Open-Meteo
-        response = requests.get(
-            WEATHER_URL,
-            params={
-                "latitude": coords["latitude"],
-                "longitude": coords["longitude"],
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
-                "temperature_unit": "fahrenheit",
-                "forecast_days": days
-            },
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        daily = data.get("daily", {})
-        dates = daily.get("time", [])
-        temp_max = daily.get("temperature_2m_max", [])
-        temp_min = daily.get("temperature_2m_min", [])
-        precip_prob = daily.get("precipitation_probability_max", [])
-        weather_codes = daily.get("weather_code", [])
-        
-        forecast_days = []
-        for i in range(len(dates)):
-            forecast_days.append({
-                "date": dates[i],
-                "temp_high_f": temp_max[i],
-                "temp_low_f": temp_min[i],
-                "precipitation_probability_percent": precip_prob[i],
-                "conditions": _weather_code_to_description(weather_codes[i])
-            })
-        
-        return {
-            "location": coords["name"],
-            "forecast_days": forecast_days
-        }
-    except Exception as e:
-        logger.error(f"Failed to get forecast for '{location}': {e}")
-        return {"error": str(e)}
+print(f"Connection details:")
+print(f"  Host: {db_host}:{db_port}")
+print(f"  Database: {db_name}")
+print(f"  User: {db_user}")
+print(f"\nCurrent User ID: {USER_ID}")
 
-def get_travel_recommendation(location: str, date: str) -> Dict[str, Any]:
-    """
-    Provide travel recommendations based on weather forecast.
-    
-    Args:
-        location: City name and state
-        date: Target date (YYYY-MM-DD format)
-    
-    Returns:
-        Dict with recommendations, weather summary, and what to bring
-    """
-    try:
-        # Parse the target date
-        target_date = datetime.strptime(date, "%Y-%m-%d").date()
-        today = datetime.now().date()
-        days_ahead = (target_date - today).days
-        
-        if days_ahead < 0:
-            return {"error": "Cannot provide recommendations for past dates"}
-        
-        if days_ahead > 16:
-            return {"error": "Forecast only available up to 16 days in advance"}
-        
-        # Get the forecast
-        forecast_data = get_forecast(location, days_ahead + 1)
-        
-        if "error" in forecast_data:
-            return forecast_data
-        
-        # Find the forecast for the target date
-        target_forecast = None
-        for day in forecast_data.get("forecast_days", []):
-            if day["date"] == date:
-                target_forecast = day
-                break
-        
-        if not target_forecast:
-            return {"error": f"No forecast data available for {date}"}
-        
-        # Build recommendations based on weather conditions
-        recommendations = []
-        items_to_bring = []
-        
-        # Precipitation recommendations
-        precip_prob = target_forecast.get("precipitation_probability_percent", 0)
-        if precip_prob > 60:
-            recommendations.append("High chance of precipitation - consider rescheduling outdoor activities")
-            items_to_bring.extend(["umbrella", "rain jacket", "waterproof shoes"])
-        elif precip_prob > 40:
-            recommendations.append("Moderate chance of rain - be prepared for wet weather")
-            items_to_bring.append("umbrella")
-        elif precip_prob > 20:
-            recommendations.append("Slight chance of rain - pack an umbrella just in case")
-        else:
-            recommendations.append("Low chance of precipitation - great day for outdoor activities")
-        
-        # Temperature recommendations
-        temp_high = target_forecast.get("temp_high_f", 70)
-        temp_low = target_forecast.get("temp_low_f", 50)
-        
-        if temp_high > 85:
-            recommendations.append("Hot weather expected - stay hydrated and avoid prolonged sun exposure")
-            items_to_bring.extend(["sunscreen", "hat", "water bottle"])
-        elif temp_high > 75:
-            recommendations.append("Warm weather - comfortable for most outdoor activities")
-            items_to_bring.append("sunscreen")
-        elif temp_high < 40:
-            recommendations.append("Cold weather - dress in warm layers")
-            items_to_bring.extend(["heavy coat", "gloves", "warm hat"])
-        elif temp_high < 55:
-            recommendations.append("Cool weather - bring a jacket or sweater")
-            items_to_bring.append("jacket")
-        
-        if temp_high - temp_low > 25:
-            recommendations.append("Large temperature swing expected - dress in layers")
-        
-        # Overall travel assessment
-        conditions = target_forecast.get("conditions", "")
-        if "clear" in conditions.lower() or "sunny" in conditions.lower():
-            overall = "Excellent travel conditions"
-        elif precip_prob > 60 or temp_high > 90 or temp_high < 32:
-            overall = "Challenging travel conditions - plan accordingly"
-        else:
-            overall = "Good travel conditions with minor considerations"
-        
-        return {
-            "location": forecast_data.get("location"),
-            "date": date,
-            "overall_assessment": overall,
-            "weather_summary": {
-                "conditions": conditions,
-                "high_temp_f": temp_high,
-                "low_temp_f": temp_low,
-                "precipitation_probability_percent": precip_prob
-            },
-            "recommendations": recommendations,
-            "items_to_bring": list(set(items_to_bring))  # Remove duplicates
-        }
-    except Exception as e:
-        logger.error(f"Failed to get travel recommendation for '{location}' on '{date}': {e}")
-        return {"error": str(e)}
+def get_connection():
+    """Get a psycopg2 connection to Lakebase."""
+    return psycopg2.connect(
+        host=db_host,
+        port=db_port,
+        dbname=db_name,
+        user=db_user,
+        password=db_password,
+        sslmode='require'
+    )
 
-def _weather_code_to_description(code: int) -> str:
-    """
-    Convert WMO weather code to human-readable description.
-    
-    Based on Open-Meteo's weather code documentation:
-    https://open-meteo.com/en/docs
-    """
-    weather_codes = {
-        0: "Clear sky",
-        1: "Mainly clear",
-        2: "Partly cloudy",
-        3: "Overcast",
-        45: "Foggy",
-        48: "Depositing rime fog",
-        51: "Light drizzle",
-        53: "Moderate drizzle",
-        55: "Dense drizzle",
-        56: "Light freezing drizzle",
-        57: "Dense freezing drizzle",
-        61: "Slight rain",
-        63: "Moderate rain",
-        65: "Heavy rain",
-        66: "Light freezing rain",
-        67: "Heavy freezing rain",
-        71: "Slight snow",
-        73: "Moderate snow",
-        75: "Heavy snow",
-        77: "Snow grains",
-        80: "Slight rain showers",
-        81: "Moderate rain showers",
-        82: "Violent rain showers",
-        85: "Slight snow showers",
-        86: "Heavy snow showers",
-        95: "Thunderstorm",
-        96: "Thunderstorm with slight hail",
-        99: "Thunderstorm with heavy hail"
-    }
-    return weather_codes.get(code, f"Unknown (code {code})")
+# COMMAND ----------
 
+# DBTITLE 1,Favorite Locations Functions
+# MAGIC %md
+# MAGIC ## Favorite Locations
+# MAGIC
+# MAGIC Save and manage user's favorite travel destinations.
 
-# ==============================================================================
-# USER ACTIONS API - Persistent storage for favorites, trips, notes, alerts
-# ==============================================================================
+# COMMAND ----------
 
+# DBTITLE 1,Favorite locations write functions
 def save_favorite_location(
     location_name: str,
     latitude: Optional[float] = None,
@@ -337,9 +109,9 @@ def save_favorite_location(
     Returns:
         Dict with success status and location ID
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -370,7 +142,6 @@ def save_favorite_location(
             }
     except Exception as e:
         conn.rollback()
-        logger.error(f"Failed to save favorite location: {e}")
         return {'success': False, 'error': str(e)}
     finally:
         conn.close()
@@ -390,9 +161,9 @@ def get_favorite_locations(
     Returns:
         List of favorite locations
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if category:
@@ -427,18 +198,71 @@ def get_favorite_locations(
                 }
                 for row in results
             ]
-    except Exception as e:
-        logger.error(f"Failed to get favorite locations: {e}")
-        return []
     finally:
         conn.close()
 
 
+def remove_favorite_location(
+    location_id: str,
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Remove a location from favorites (soft delete).
+    
+    Args:
+        location_id: UUID of the location to remove
+        user_id: User ID (defaults to current user)
+    
+    Returns:
+        Dict with success status
+    """
+    user_id = user_id or USER_ID
+    
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE user_favorite_locations
+                SET is_active = FALSE, updated_at = NOW()
+                WHERE id = %s AND user_id = %s
+            """, (location_id, user_id))
+            
+            conn.commit()
+            
+            if cur.rowcount > 0:
+                return {'success': True, 'message': 'Location removed from favorites'}
+            else:
+                return {'success': False, 'error': 'Location not found'}
+    except Exception as e:
+        conn.rollback()
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+# Test the functions
+print("Favorite Locations API loaded successfully!")
+print("\nAvailable functions:")
+print("  - save_favorite_location(location_name, latitude, longitude, nickname, category, notes)")
+print("  - get_favorite_locations(category=None)")
+print("  - remove_favorite_location(location_id)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Trips Functions
+# MAGIC %md
+# MAGIC ## Trips
+# MAGIC
+# MAGIC Log and track user's travel plans with dates, budget, and preferences.
+
+# COMMAND ----------
+
+# DBTITLE 1,Trips write functions
 def create_trip(
     trip_name: str,
     destination: str,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     travelers_count: Optional[int] = None,
     budget_amount: Optional[float] = None,
     weather_preferences: Optional[Dict] = None,
@@ -452,8 +276,8 @@ def create_trip(
     Args:
         trip_name: Name of the trip
         destination: Destination location
-        start_date: Trip start date (YYYY-MM-DD)
-        end_date: Trip end date (YYYY-MM-DD)
+        start_date: Trip start date
+        end_date: Trip end date
         travelers_count: Number of travelers
         budget_amount: Budget in dollars
         weather_preferences: Dict with preferences like {'ideal_temp': 75, 'avoid_rain': True}
@@ -464,9 +288,9 @@ def create_trip(
     Returns:
         Dict with success status and trip ID
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -495,7 +319,6 @@ def create_trip(
             }
     except Exception as e:
         conn.rollback()
-        logger.error(f"Failed to create trip: {e}")
         return {'success': False, 'error': str(e)}
     finally:
         conn.close()
@@ -515,9 +338,9 @@ def get_trips(
     Returns:
         List of trips
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if status:
@@ -558,13 +381,71 @@ def get_trips(
                 }
                 for row in results
             ]
-    except Exception as e:
-        logger.error(f"Failed to get trips: {e}")
-        return []
     finally:
         conn.close()
 
 
+def update_trip_status(
+    trip_id: str,
+    status: str,
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Update trip status.
+    
+    Args:
+        trip_id: UUID of the trip
+        status: New status ('planned', 'active', 'completed', 'cancelled')
+        user_id: User ID (defaults to current user)
+    
+    Returns:
+        Dict with success status
+    """
+    user_id = user_id or USER_ID
+    
+    valid_statuses = ['planned', 'active', 'completed', 'cancelled']
+    if status not in valid_statuses:
+        return {'success': False, 'error': f'Invalid status. Must be one of: {valid_statuses}'}
+    
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE user_trips
+                SET status = %s, updated_at = NOW()
+                WHERE id = %s AND user_id = %s
+            """, (status, trip_id, user_id))
+            
+            conn.commit()
+            
+            if cur.rowcount > 0:
+                return {'success': True, 'message': f'Trip status updated to {status}'}
+            else:
+                return {'success': False, 'error': 'Trip not found'}
+    except Exception as e:
+        conn.rollback()
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+print("Trips API loaded successfully!")
+print("\nAvailable functions:")
+print("  - create_trip(trip_name, destination, start_date, end_date, ...)")
+print("  - get_trips(status=None)")
+print("  - update_trip_status(trip_id, status)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Notes Functions
+# MAGIC %md
+# MAGIC ## Notes
+# MAGIC
+# MAGIC Store location-specific and trip-related notes.
+
+# COMMAND ----------
+
+# DBTITLE 1,Notes write functions
 def create_note(
     content: str,
     title: Optional[str] = None,
@@ -591,13 +472,13 @@ def create_note(
     Returns:
         Dict with success status and note ID
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
     valid_types = ['general', 'recommendation', 'warning', 'reminder']
     if note_type not in valid_types:
         return {'success': False, 'error': f'Invalid note_type. Must be one of: {valid_types}'}
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -621,7 +502,6 @@ def create_note(
             }
     except Exception as e:
         conn.rollback()
-        logger.error(f"Failed to create note: {e}")
         return {'success': False, 'error': str(e)}
     finally:
         conn.close()
@@ -647,9 +527,9 @@ def get_notes(
     Returns:
         List of notes
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             query = """
@@ -695,20 +575,71 @@ def get_notes(
                 }
                 for row in results
             ]
-    except Exception as e:
-        logger.error(f"Failed to get notes: {e}")
-        return []
     finally:
         conn.close()
 
 
+def delete_note(
+    note_id: str,
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Delete a note.
+    
+    Args:
+        note_id: UUID of the note
+        user_id: User ID (defaults to current user)
+    
+    Returns:
+        Dict with success status
+    """
+    user_id = user_id or USER_ID
+    
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM user_notes
+                WHERE id = %s AND user_id = %s
+            """, (note_id, user_id))
+            
+            conn.commit()
+            
+            if cur.rowcount > 0:
+                return {'success': True, 'message': 'Note deleted'}
+            else:
+                return {'success': False, 'error': 'Note not found'}
+    except Exception as e:
+        conn.rollback()
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+print("Notes API loaded successfully!")
+print("\nAvailable functions:")
+print("  - create_note(content, title, location, trip_id, note_type, tags, is_pinned)")
+print("  - get_notes(trip_id, location, note_type, pinned_only)")
+print("  - delete_note(note_id)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Alerts Functions
+# MAGIC %md
+# MAGIC ## Alerts
+# MAGIC
+# MAGIC Set up weather alerts and custom notifications for locations and trips.
+
+# COMMAND ----------
+
+# DBTITLE 1,Alerts write functions
 def create_alert(
     location: str,
     alert_type: str,
     alert_condition: Dict,
     trip_id: Optional[str] = None,
     notification_method: str = 'in_app',
-    expires_at: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
     user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -721,13 +652,13 @@ def create_alert(
             {'temp_above': 90} or {'weather_event': 'thunderstorm'}
         trip_id: Associated trip UUID
         notification_method: Method ('in_app', 'email', 'both')
-        expires_at: Optional expiration datetime (ISO format string)
+        expires_at: Optional expiration datetime
         user_id: User ID (defaults to current user)
     
     Returns:
         Dict with success status and alert ID
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
     valid_types = ['weather', 'price', 'reminder', 'custom']
     if alert_type not in valid_types:
@@ -737,7 +668,7 @@ def create_alert(
     if notification_method not in valid_methods:
         return {'success': False, 'error': f'Invalid notification_method. Must be one of: {valid_methods}'}
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -763,7 +694,6 @@ def create_alert(
             }
     except Exception as e:
         conn.rollback()
-        logger.error(f"Failed to create alert: {e}")
         return {'success': False, 'error': str(e)}
     finally:
         conn.close()
@@ -787,9 +717,9 @@ def get_alerts(
     Returns:
         List of alerts
     """
-    user_id = user_id or _get_current_user_id()
+    user_id = user_id or USER_ID
     
-    conn = _get_lakebase_connection()
+    conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             query = """
@@ -835,8 +765,236 @@ def get_alerts(
                 }
                 for row in results
             ]
-    except Exception as e:
-        logger.error(f"Failed to get alerts: {e}")
-        return []
     finally:
         conn.close()
+
+
+def deactivate_alert(
+    alert_id: str,
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Deactivate an alert.
+    
+    Args:
+        alert_id: UUID of the alert
+        user_id: User ID (defaults to current user)
+    
+    Returns:
+        Dict with success status
+    """
+    user_id = user_id or USER_ID
+    
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE user_alerts
+                SET is_active = FALSE, updated_at = NOW()
+                WHERE id = %s AND user_id = %s
+            """, (alert_id, user_id))
+            
+            conn.commit()
+            
+            if cur.rowcount > 0:
+                return {'success': True, 'message': 'Alert deactivated'}
+            else:
+                return {'success': False, 'error': 'Alert not found'}
+    except Exception as e:
+        conn.rollback()
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+def trigger_alert(
+    alert_id: str,
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Mark an alert as triggered (used by monitoring systems).
+    
+    Args:
+        alert_id: UUID of the alert
+        user_id: User ID (defaults to current user)
+    
+    Returns:
+        Dict with success status
+    """
+    user_id = user_id or USER_ID
+    
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE user_alerts
+                SET triggered_count = triggered_count + 1,
+                    last_triggered_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s AND user_id = %s AND is_active = TRUE
+            """, (alert_id, user_id))
+            
+            conn.commit()
+            
+            if cur.rowcount > 0:
+                return {'success': True, 'message': 'Alert triggered'}
+            else:
+                return {'success': False, 'error': 'Alert not found or inactive'}
+    except Exception as e:
+        conn.rollback()
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+
+print("Alerts API loaded successfully!")
+print("\nAvailable functions:")
+print("  - create_alert(location, alert_type, alert_condition, trip_id, notification_method, expires_at)")
+print("  - get_alerts(location, alert_type, active_only)")
+print("  - deactivate_alert(alert_id)")
+print("  - trigger_alert(alert_id)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Example Usage
+# MAGIC %md
+# MAGIC ## Example Usage
+# MAGIC
+# MAGIC Demonstrates how to use the write/action functions.
+
+# COMMAND ----------
+
+# DBTITLE 1,Example: Save favorite location
+# Example: Save a favorite vacation spot
+result = save_favorite_location(
+    location_name="Maui, Hawaii",
+    latitude=20.7984,
+    longitude=-156.3319,
+    nickname="Dream Vacation Spot",
+    category="vacation",
+    notes="Best beaches, great weather year-round"
+)
+
+print(json.dumps(result, indent=2))
+
+# COMMAND ----------
+
+# DBTITLE 1,Example: Create a trip
+from datetime import date
+
+# Example: Plan a summer trip
+trip_result = create_trip(
+    trip_name="Summer Beach Vacation",
+    destination="Maui, Hawaii",
+    start_date=date(2026, 7, 15),
+    end_date=date(2026, 7, 22),
+    travelers_count=2,
+    budget_amount=3500.00,
+    weather_preferences={
+        'ideal_temp_min': 75,
+        'ideal_temp_max': 85,
+        'avoid_rain': True
+    },
+    activities=['snorkeling', 'hiking', 'surfing'],
+    metadata={'accommodation': 'resort', 'rental_car': True}
+)
+
+print(json.dumps(trip_result, indent=2))
+
+# Store trip_id for later examples
+if trip_result['success']:
+    example_trip_id = trip_result['id']
+    print(f"\nSaved trip ID: {example_trip_id}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Example: Create a note
+# Example: Add a recommendation note
+note_result = create_note(
+    title="Best Snorkeling Spot",
+    content="Molokini Crater is amazing for snorkeling - crystal clear water, tons of fish. Book early morning tour!",
+    location="Maui, Hawaii",
+    trip_id=example_trip_id if 'example_trip_id' in locals() else None,
+    note_type="recommendation",
+    tags=['snorkeling', 'must-do', 'marine-life'],
+    is_pinned=True
+)
+
+print(json.dumps(note_result, indent=2))
+
+# COMMAND ----------
+
+# DBTITLE 1,Example: Create a weather alert
+from datetime import datetime, timedelta
+
+# Example: Set up a weather alert for the trip
+alert_result = create_alert(
+    location="Maui, Hawaii",
+    alert_type="weather",
+    alert_condition={
+        'temp_above': 90,
+        'weather_events': ['thunderstorm', 'tropical storm'],
+        'trigger_days_before_trip': 7
+    },
+    trip_id=example_trip_id if 'example_trip_id' in locals() else None,
+    notification_method="both",
+    expires_at=datetime.now() + timedelta(days=90)
+)
+
+print(json.dumps(alert_result, indent=2))
+
+# COMMAND ----------
+
+# DBTITLE 1,Example: Retrieve data
+# Retrieve all saved data
+print("=" * 80)
+print("FAVORITE LOCATIONS")
+print("=" * 80)
+favorites = get_favorite_locations()
+for fav in favorites:
+    print(f"\n📍 {fav['nickname'] or fav['location_name']}")
+    print(f"   Location: {fav['location_name']}")
+    print(f"   Category: {fav['category']}")
+    if fav['notes']:
+        print(f"   Notes: {fav['notes']}")
+
+print("\n" + "=" * 80)
+print("TRIPS")
+print("=" * 80)
+trips = get_trips()
+for trip in trips:
+    print(f"\n✈️  {trip['trip_name']}")
+    print(f"   Destination: {trip['destination']}")
+    print(f"   Status: {trip['status']}")
+    if trip['start_date']:
+        print(f"   Dates: {trip['start_date']} to {trip['end_date']}")
+    if trip['budget_amount']:
+        print(f"   Budget: ${trip['budget_amount']:.2f}")
+
+print("\n" + "=" * 80)
+print("NOTES")
+print("=" * 80)
+notes = get_notes()
+for note in notes:
+    pin_emoji = "📌" if note['is_pinned'] else "📝"
+    print(f"\n{pin_emoji} {note['title'] or 'Untitled Note'}")
+    print(f"   Type: {note['note_type']}")
+    if note['location']:
+        print(f"   Location: {note['location']}")
+    print(f"   Content: {note['content'][:100]}..." if len(note['content']) > 100 else f"   Content: {note['content']}")
+
+print("\n" + "=" * 80)
+print("ALERTS")
+print("=" * 80)
+alerts = get_alerts()
+for alert in alerts:
+    print(f"\n🔔 {alert['alert_type'].upper()} Alert")
+    print(f"   Location: {alert['location']}")
+    print(f"   Condition: {json.dumps(alert['alert_condition'])}")
+    print(f"   Method: {alert['notification_method']}")
+    print(f"   Active: {alert['is_active']}")
+    if alert['triggered_count'] > 0:
+        print(f"   Triggered: {alert['triggered_count']} times (last: {alert['last_triggered_at']})")
+
+# COMMAND ----------
+

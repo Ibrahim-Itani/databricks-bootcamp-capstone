@@ -277,6 +277,212 @@ def vector_search(query: str, limit: int = 10) -> dict:
         logger.exception("Vector search failed")
         return {"error": str(e)}
 
+
+# ==============================================================================
+# USER ACTIONS TOOLS - Persistent storage for favorites, trips, notes, alerts
+# ==============================================================================
+
+@mcp.tool
+@trace_tool
+def save_favorite_location(
+    location_name: str,
+    latitude: float = None,
+    longitude: float = None,
+    nickname: str = None,
+    category: str = None,
+    notes: str = None
+) -> dict:
+    """
+    Save a location to the user's favorites list.
+    
+    Args:
+        location_name: Name of the location (e.g., "Paris, France")
+        latitude: Latitude coordinate (optional)
+        longitude: Longitude coordinate (optional)
+        nickname: User-friendly name for the location (optional)
+        category: Category like 'home', 'work', 'vacation', 'family' (optional)
+        notes: Additional notes about the location (optional)
+    
+    Returns:
+        Dict with success status and location ID, or error message
+    """
+    return weather_broker.save_favorite_location(
+        location_name, latitude, longitude, nickname, category, notes
+    )
+
+
+@mcp.tool
+@trace_tool
+def get_favorite_locations(category: str = None) -> dict:
+    """
+    Retrieve the user's favorite locations.
+    
+    Args:
+        category: Filter by category (optional). Categories: 'home', 'work', 'vacation', 'family'
+    
+    Returns:
+        List of favorite locations with details
+    """
+    locations = weather_broker.get_favorite_locations(category)
+    return {"locations": locations, "count": len(locations)}
+
+
+@mcp.tool
+@trace_tool
+def create_trip(
+    trip_name: str,
+    destination: str,
+    start_date: str = None,
+    end_date: str = None,
+    travelers_count: int = None,
+    budget_amount: float = None,
+    weather_preferences: dict = None,
+    activities: list = None
+) -> dict:
+    """
+    Create a new trip with travel plans.
+    
+    Args:
+        trip_name: Name of the trip (required)
+        destination: Destination location (required)
+        start_date: Trip start date in YYYY-MM-DD format (optional)
+        end_date: Trip end date in YYYY-MM-DD format (optional)
+        travelers_count: Number of travelers (optional)
+        budget_amount: Budget in dollars (optional)
+        weather_preferences: Dict with preferences like {'ideal_temp_min': 65, 'ideal_temp_max': 85, 'avoid_rain': True} (optional)
+        activities: List of planned activities (optional)
+    
+    Returns:
+        Dict with success status and trip ID, or error message
+    """
+    return weather_broker.create_trip(
+        trip_name, destination, start_date, end_date,
+        travelers_count, budget_amount, weather_preferences, activities
+    )
+
+
+@mcp.tool
+@trace_tool
+def get_trips(status: str = None) -> dict:
+    """
+    Retrieve the user's trips.
+    
+    Args:
+        status: Filter by status (optional). Valid values: 'planned', 'active', 'completed', 'cancelled'
+    
+    Returns:
+        List of trips with details
+    """
+    trips = weather_broker.get_trips(status)
+    return {"trips": trips, "count": len(trips)}
+
+
+@mcp.tool
+@trace_tool
+def create_note(
+    content: str,
+    title: str = None,
+    location: str = None,
+    trip_id: str = None,
+    note_type: str = 'general',
+    tags: list = None,
+    is_pinned: bool = False
+) -> dict:
+    """
+    Create a new note for a location or trip.
+    
+    Args:
+        content: Note content (required)
+        title: Note title (optional)
+        location: Associated location (optional)
+        trip_id: Associated trip UUID (optional)
+        note_type: Type of note - 'general', 'recommendation', 'warning', or 'reminder' (default: 'general')
+        tags: List of tags for categorization (optional)
+        is_pinned: Pin note to top (default: False)
+    
+    Returns:
+        Dict with success status and note ID, or error message
+    """
+    return weather_broker.create_note(
+        content, title, location, trip_id, note_type, tags, is_pinned
+    )
+
+
+@mcp.tool
+@trace_tool
+def get_notes(
+    trip_id: str = None,
+    location: str = None,
+    note_type: str = None,
+    pinned_only: bool = False
+) -> dict:
+    """
+    Retrieve the user's notes with optional filters.
+    
+    Args:
+        trip_id: Filter by trip UUID (optional)
+        location: Filter by location (optional)
+        note_type: Filter by type - 'general', 'recommendation', 'warning', 'reminder' (optional)
+        pinned_only: Only return pinned notes (default: False)
+    
+    Returns:
+        List of notes with details
+    """
+    notes = weather_broker.get_notes(trip_id, location, note_type, pinned_only)
+    return {"notes": notes, "count": len(notes)}
+
+
+@mcp.tool
+@trace_tool
+def create_alert(
+    location: str,
+    alert_type: str,
+    alert_condition: dict,
+    trip_id: str = None,
+    notification_method: str = 'in_app',
+    expires_at: str = None
+) -> dict:
+    """
+    Create a new alert for weather conditions or custom events.
+    
+    Args:
+        location: Location to monitor (required)
+        alert_type: Type of alert - 'weather', 'price', 'reminder', or 'custom' (required)
+        alert_condition: Dict with conditions, e.g., {'temp_above': 90, 'weather_events': ['thunderstorm']} (required)
+        trip_id: Associated trip UUID (optional)
+        notification_method: Notification method - 'in_app', 'email', or 'both' (default: 'in_app')
+        expires_at: Optional expiration datetime in ISO format (optional)
+    
+    Returns:
+        Dict with success status and alert ID, or error message
+    """
+    return weather_broker.create_alert(
+        location, alert_type, alert_condition, trip_id, notification_method, expires_at
+    )
+
+
+@mcp.tool
+@trace_tool
+def get_alerts(
+    location: str = None,
+    alert_type: str = None,
+    active_only: bool = True
+) -> dict:
+    """
+    Retrieve the user's alerts.
+    
+    Args:
+        location: Filter by location (optional)
+        alert_type: Filter by type - 'weather', 'price', 'reminder', 'custom' (optional)
+        active_only: Only return active alerts (default: True)
+    
+    Returns:
+        List of alerts with details
+    """
+    alerts = weather_broker.get_alerts(location, alert_type, active_only)
+    return {"alerts": alerts, "count": len(alerts)}
+
+
 if __name__ == "__main__":
     # Add middleware to capture request headers for end-user identity
     # This must be done before mcp.run() is called

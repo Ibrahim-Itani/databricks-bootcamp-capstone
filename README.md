@@ -22,6 +22,10 @@ A Model Context Protocol (MCP) server that provides weather data and intelligent
 │  │  │  • get_forecast(location, days)                     │  │  │
 │  │  │  • get_travel_recommendation(location, date)        │  │  │
 │  │  │  • vector_search(query, limit)                      │  │  │
+│  │  │  • save_favorite_location / get_favorite_locations  │  │  │
+│  │  │  • create_trip / get_trips                          │  │  │
+│  │  │  • create_note / get_notes                          │  │  │
+│  │  │  • create_alert / get_alerts                        │  │  │
 │  │  └─────────────────────────────────────────────────────┘  │  │
 │  │               │                            │                │  │
 │  └───────────────┼────────────────────────────┼────────────────┘  │
