@@ -313,6 +313,31 @@ def _weather_code_to_description(code: int) -> str:
 # USER ACTIONS API - Persistent storage for favorites, trips, notes, alerts
 # ==============================================================================
 
+def _get_current_user_id() -> str:
+    """Get the current Databricks user's email as user ID."""
+    return _w.current_user.me().user_name
+
+def _get_lakebase_connection():
+    """Get a direct psycopg2 connection to Lakebase."""
+    import psycopg2
+    from urllib.parse import urlparse
+    
+    # Get the Lakebase URL from the secret
+    lakebase_url = lakebase._lakebase_url()
+    
+    # Parse the connection URL
+    parsed = urlparse(lakebase_url)
+    
+    return psycopg2.connect(
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        dbname=parsed.path.lstrip('/'),
+        user=parsed.username,
+        password=parsed.password,
+        sslmode='require',
+        cursor_factory=RealDictCursor
+    )
+
 def save_favorite_location(
     location_name: str,
     latitude: Optional[float] = None,
@@ -341,7 +366,7 @@ def save_favorite_location(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO user_favorite_locations 
                 (user_id, location_name, latitude, longitude, nickname, category, notes)
@@ -394,7 +419,7 @@ def get_favorite_locations(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             if category:
                 cur.execute("""
                     SELECT id, location_name, latitude, longitude, nickname, 
@@ -468,7 +493,7 @@ def create_trip(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO user_trips 
                 (user_id, trip_name, destination, start_date, end_date, 
@@ -519,7 +544,7 @@ def get_trips(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             if status:
                 cur.execute("""
                     SELECT id, trip_name, destination, start_date, end_date, status,
@@ -599,7 +624,7 @@ def create_note(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO user_notes 
                 (user_id, trip_id, location, title, content, note_type, tags, is_pinned)
@@ -651,7 +676,7 @@ def get_notes(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             query = """
                 SELECT id, trip_id, location, title, content, note_type, 
                        tags, is_pinned, created_at, updated_at
@@ -739,7 +764,7 @@ def create_alert(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO user_alerts 
                 (user_id, trip_id, location, alert_type, alert_condition, 
@@ -791,7 +816,7 @@ def get_alerts(
     
     conn = _get_lakebase_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             query = """
                 SELECT id, trip_id, location, alert_type, alert_condition,
                        notification_method, is_active, triggered_count,
