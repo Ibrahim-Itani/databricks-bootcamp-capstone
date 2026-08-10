@@ -73,6 +73,11 @@ Notes and repository specifics
 - Observability: the MCP server uses a `@trace_tool` decorator and stores traces in a DB table for tool observability (see code comments in the broker and server files).
 - Filenames: `notebooks/ingest_weather_embeddings.py.py` appears to have a duplicated extension; consider renaming for clarity.
 
+Example Response:
+
+<img width="844" height="397" alt="Screenshot 2026-08-10 at 4 49 27 pm" src="https://github.com/user-attachments/assets/b1e33083-ec33-4465-aba9-4d59b96b2f6b" />
+
+
 Contributing
 
 - Bug fixes and improvements are welcome. When modifying database schemas or the ingestion pipeline, include SQL migrations and update the README and USER_ACTIONS_README.md as appropriate.
